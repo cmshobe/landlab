@@ -237,6 +237,8 @@ class StreamPowerEroder(object):
         is not an excess stream power; any specified erosion threshold is not
         incorporated into it.
         """
+        slopes_from_elevs = True  # force it
+        internal_elapsed_time = 0.
         active_nodes = np.where(grid.status_at_node != CLOSED_BOUNDARY)[0]
 
         if W_if_used!=None:
@@ -256,40 +258,7 @@ class StreamPowerEroder(object):
             node_z = grid.at_node[node_elevs]
         else:
             node_z = node_elevs
-
-        #Perform check on whether we use grid or direct fed data:
-        try:
-            self.slopes = grid.at_node[slopes_at_nodes]
-        except TypeError:
-            if type(slopes_at_nodes)==np.ndarray:
-                self.slopes = slopes_at_nodes
-            else:
-                raise TypeError('slopes_at_nodes input not recognised')
-        except FieldError:
-            if slopes_from_elevs==True:
-                S_links = (node_z[grid.node_at_link_tail]-node_z[grid.node_at_link_head])/grid.link_length
-            else:
-                if link_slopes:
-                    if type(link_slopes)==str:
-                        S_links = grid.at_link[link_slopes]
-                    else:
-                        S_links = link_slopes
-                else:
-                    S_links = grid.at_link['planet_surface__derivative_of_elevation']
-
-            #put the slopes onto the nodes
-            try:
-                self.slopes = S_links[grid.at_node[link_node_mapping]]
-            except TypeError:
-                try:
-                    self.slopes = S_links[link_node_mapping]
-                except IndexError:
-                    #need to do the mapping on the fly.
-                    #we're going to use the max slope (i.e., + or -) of *all* adjacent nodes.
-                    #This isn't ideal. It should probably just be the outs...
-                    #i.e., np.max(self.link_S_with_trailing_blank[grid.node_outlinks] AND -self.link_S_with_trailing_blank[grid.node_inlinks])
-                    self.link_S_with_trailing_blank[:-1] = S_links
-                    self.slopes = np.amax(np.fabs(self.link_S_with_trailing_blank[grid.links_at_node.T]),axis=0)
+        initial_node_z = node_z.copy()
 
         if type(node_drainage_areas)==str:
             node_A = grid.at_node[node_drainage_areas]
@@ -303,12 +272,13 @@ class StreamPowerEroder(object):
             node_order_upstream = grid.at_node[node_order_upstream]
             
         # Disable incision in flooded nodes, as appropriate
+        # note node flooding only updates every dt
         if flooded_nodes is not None:
             self._K_unit_time[flooded_nodes[active_nodes]] = 0.
 
-        #Operate the main function:
+        # build the time-invariant parts of the equ.
         if self.use_W==False and self.use_Q==False: #normal case
-            stream_power_active_nodes = self._K_unit_time * dt * node_A[active_nodes]**self._m * self.slopes[active_nodes]**self._n
+            wavespeed = self._K_unit_time * node_A[active_nodes]**self._m
         elif self.use_W:
             try:
                 W = grid.at_node[W_if_used]
@@ -319,37 +289,84 @@ class StreamPowerEroder(object):
                     Q_direct = grid.at_node[Q_if_used]
                 except TypeError:
                     Q_direct = Q_if_used
-                stream_power_active_nodes = self._K_unit_time * dt * Q_direct[active_nodes]**self._m * self.slopes[active_nodes]**self._n / W
+                wavespeed = self._K_unit_time * Q_direct[active_nodes]**self._m / W
             else: #just W to be used
-                stream_power_active_nodes = self._K_unit_time * dt * node_A[active_nodes]**self._m * self.slopes[active_nodes]**self._n / W
+                wavespeed = self._K_unit_time * node_A[active_nodes]**self._m / W
         else: #just use_Q
             try:
                 Q_direct = grid.at_node[Q_if_used]
             except TypeError:
                 assert type(Q_if_used) in (np.ndarray, list)
                 Q_direct = Q_if_used
-            stream_power_active_nodes = self._K_unit_time * dt * Q_direct[active_nodes]**self._m * self.slopes[active_nodes]**self._n
+            wavespeed = self._K_unit_time * Q_direct[active_nodes]**self._m
 
-        #Note that we save "stream_power_erosion" incorporating both K and a. Most definitions would need this value /K then **(1/a) to give actual stream power (unit, total, whatever), and it does not yet include the threshold
-        self.stream_power_erosion[active_nodes] = stream_power_active_nodes
-        grid.at_node['stream_power_erosion'] = self.stream_power_erosion
-        #print "max stream power: ", self.stream_power_erosion.max()
-        erosion_increment = (self.stream_power_erosion - self.sp_crit).clip(0.)
+            # establish a Courant tstep condition
+            stable_tstep = (self.grid.link_length[link_node_mapping][
+                            active_nodes]/wavespeed).min()
 
+        while internal_elapsed_time < dt:
+            #Perform check on whether we use grid or direct fed data:
+            try:
+                self.slopes = grid.at_node[slopes_at_nodes]
+                if slopes_from_elevs:
+                    raise FieldError
+            except TypeError:
+                if type(slopes_at_nodes)==np.ndarray:
+                    self.slopes = slopes_at_nodes
+                else:
+                    raise TypeError('slopes_at_nodes input not recognised')
+            except FieldError:
+                if slopes_from_elevs==True:
+                    S_links = (node_z[grid.node_at_link_tail]-node_z[grid.node_at_link_head])/grid.link_length
+                else:
+                    if link_slopes:
+                        if type(link_slopes)==str:
+                            S_links = grid.at_link[link_slopes]
+                        else:
+                            S_links = link_slopes
+                    else:
+                        S_links = grid.at_link['planet_surface__derivative_of_elevation']
+
+                #put the slopes onto the nodes
+                try:
+                    self.slopes = S_links[grid.at_node[link_node_mapping]]
+                except TypeError:
+                    try:
+                        self.slopes = S_links[link_node_mapping]
+                    except IndexError:
+                        #need to do the mapping on the fly.
+                        #we're going to use the max slope (i.e., + or -) of *all* adjacent nodes.
+                        #This isn't ideal. It should probably just be the outs...
+                        #i.e., np.max(self.link_S_with_trailing_blank[grid.node_outlinks] AND -self.link_S_with_trailing_blank[grid.node_inlinks])
+                        self.link_S_with_trailing_blank[:-1] = S_links
+                        self.slopes = np.amax(np.fabs(self.link_S_with_trailing_blank[grid.links_at_node.T]),axis=0)
+
+            # Operate the main function:
+            stream_power_active_nodes = wavespeed * self.slopes[active_nodes]**self._n
+            time_remainder = (dt-internal_elapsed_time).clip(0.)
+            dt_to_use = min(time_remainder, stable_tstep)
+            
+            try:
+                node_z[active_nodes] -= dt_to_use*(stream_power_active_nodes - self.sp_crit[active_nodes]).clip(0.)
+            except TypeError:
+                node_z[active_nodes] -= dt_to_use*(stream_power_active_nodes - self.sp_crit).clip(0.)
+            internal_elapsed_time += dt_to_use
+
+        erosion_increment = initial_node_z - node_z
         #this prevents any node from incising below any node downstream of it
         #we have to go in upstream order in case our rate is so big we impinge on baselevels > 1 node away
 
-        elev_dstr = node_z[flow_receiver]# we substract erosion_increment[flow_receiver] in the loop, as it can update
+        elev_dstr = initial_node_z[flow_receiver]# we substract erosion_increment[flow_receiver] in the loop, as it can update
 
         method = 'cython'
         if method == 'cython':
             from .cfuncs import erode_avoiding_pits
 
-            erode_avoiding_pits(node_order_upstream, flow_receiver, node_z,
+            erode_avoiding_pits(node_order_upstream, flow_receiver, initial_node_z,
                                 erosion_increment)
         else:
             for i in node_order_upstream:
-                elev_this_node_before = node_z[i]
+                elev_this_node_before = initial_node_z[i]
                 elev_this_node_after = elev_this_node_before - erosion_increment[i]
                 elev_dstr_node_after = elev_dstr[i] - erosion_increment[flow_receiver[i]]
                 if elev_this_node_after<elev_dstr_node_after:
